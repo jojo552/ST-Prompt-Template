@@ -4,6 +4,9 @@
 	"requires": [],
 	"optional": [],
 	"js": "dist/index.js",
+	"hooks": {
+		"chatSurface": "registerChatSurface"
+	},
 	"css": "",
 	"author": "zonde306",
 	"version": "1.17.9",

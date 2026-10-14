@@ -1,4 +1,4 @@
-import { init as finit, exit as fexit } from './modules/handler';
+import { init as finit, exit as fexit, registerChatSurfaceProcessor } from './modules/handler';
 import { init as vinit, exit as vexit } from './modules/command';
 import { init as uinit, exit as uexit } from './modules/ui';
 import { init as einit, exit as eexit } from './modules/exports';
@@ -48,7 +48,24 @@ const plugin: Plugin = {
 
 export default plugin;
 
+let initialization: Promise<void> | null = null;
+
+function initOnce(): Promise<void> {
+    initialization ??= init();
+    return initialization;
+}
+
+/**
+ * TauriTavern ChatSurface manifest hook (`hooks.chatSurface`).
+ * TauriTavern only calls it with Chat DOM virtualization enabled, before the first chat projection.
+ * Upstream SillyTavern ignores the hook and keeps the static DOM renderer.
+ */
+export async function registerChatSurface() {
+    await initOnce();
+    registerChatSurfaceProcessor();
+}
+
 // jQuery
 $(async () => {
-    await init();
+    await initOnce();
 });

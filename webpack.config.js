@@ -11,7 +11,6 @@ const serverConfig = {
         path: _resolve('.', 'dist'),
         filename: 'index.js',
         libraryTarget: 'module',
-        libraryExport: 'default',
     },
     resolve: {
         extensions: ['.ts', '.js'],

@@ -414,6 +414,8 @@ async function handleMessageRender(message_id: string, type?: string, isDryRun?:
 
     // Prevent infinite recursion
     if (isFakeRun) return;
+    // TauriTavern ChatSurface renders through the content processor; never write the live DOM.
+    if (chatSurfaceRegistration) return;
 
     // Is it just a re-render?
     STATE.isDryRun = !!isDryRun;
@@ -449,6 +451,67 @@ async function handleMessageRender(message_id: string, type?: string, isDryRun?:
     if (isDryRun && !message?.is_ejs_processed?.[message.swipe_id || 0])
         STATE.isDryRun = isDryRun = false;
 
+    const { content, newContent } = await evaluateMessageContent(message_idx, message, !!isDryRun, {
+        readContent: () => container.html() as string,
+        commitRawMessage: () => updateMessageBlock(message_idx, message, { rerenderMessage: true }),
+    });
+
+    // update if changed
+    if (newContent && newContent !== content) {
+        container.html(newContent);
+        updateReasoningUI(parent);
+        addCopyToCodeBlocks(parent);
+        appendMediaToMessage(message, parent);
+    }
+
+    // Because the `<pre>` tag has been modified, and other extensions need to access it, a re-rendering is required to display the new content.
+    if (newContent?.includes('<pre>') && isDryRun) {
+        isFakeRun = true; // Prevent infinite recursion
+        console.debug(`[HTML] rendering #${message_idx} message`);
+        if (message.is_user) {
+            await eventSource.emit(event_types.USER_MESSAGE_RENDERED, message_id);
+        } else if (!message.is_system) {
+            await eventSource.emit(event_types.CHARACTER_MESSAGE_RENDERED, message_id, type);
+        }
+        isFakeRun = false;
+    }
+
+    markEjsProcessed(message);
+
+    const end = Date.now() - start;
+    console.log(`[Prompt Template] processing #${message_idx} messages in ${end}ms`);
+
+    if (!isDryRun) {
+        await checkAndSave();
+        updateTokens(container.text(), 'receive');
+    }
+}
+
+function markEjsProcessed(message: Message) {
+    if (!message.is_ejs_processed)
+        message.is_ejs_processed = [];
+    message.is_ejs_processed[message.swipe_id || 0] = true;
+}
+
+interface MessageRenderTarget {
+    /** Formatted HTML of the message, read after any permanent raw message change. */
+    readContent: () => string | Promise<string>;
+    /** Called after `message.mes` has been permanently rewritten by raw evaluation. */
+    commitRawMessage: () => void;
+    signal?: AbortSignal;
+}
+
+/**
+ * Evaluate the display templates of a message without touching the live DOM.
+ * `content` is the template input; `newContent` is null when evaluation failed or produced nothing.
+ */
+async function evaluateMessageContent(
+    message_idx: number,
+    message: Message,
+    isDryRun: boolean,
+    target: MessageRenderTarget,
+): Promise<{ rawContent: string | null; content: string | null; newContent: string | null }> {
+    const message_id = String(message_idx);
     const env = await prepareContext(message_idx, {
         runType: 'render',
         message_id: message_idx,
@@ -471,6 +534,7 @@ async function handleMessageRender(message_id: string, type?: string, isDryRun?:
     const sandbox = settings.sandbox ? new FunctionSandbox() : null;
     let newContent: string | null = null;
     let content: string | null = null;
+    let rawContent: string | null = null;
 
     try {
         // [RENDER:BEFORE] or @@render_before
@@ -516,14 +580,15 @@ async function handleMessageRender(message_id: string, type?: string, isDryRun?:
                 }
             );
             env.runType = 'render';
-            if (newContent != null) {
+            // A superseded ChatSurface request must not write back a stale result.
+            if (newContent != null && !target.signal?.aborted) {
                 // Permanent modification
                 message.mes = newContent;
-                updateMessageBlock(message_idx, message, { rerenderMessage: true });
+                target.commitRawMessage();
             }
         }
 
-        const rawContent = container.html() as string;
+        rawContent = await target.readContent();
 
         content = settings.code_blocks_enabled === false ? escapePreContent(rawContent) : rawContent;
 
@@ -585,36 +650,103 @@ async function handleMessageRender(message_id: string, type?: string, isDryRun?:
         sandbox?.destroy();
     }
 
-    // update if changed
-    if (newContent && newContent !== content) {
-        container.html(newContent);
-        updateReasoningUI(parent);
-        addCopyToCodeBlocks(parent);
-        appendMediaToMessage(message, parent);
-    }
+    return { rawContent, content, newContent };
+}
 
-    // Because the `<pre>` tag has been modified, and other extensions need to access it, a re-rendering is required to display the new content.
-    if (newContent?.includes('<pre>') && isDryRun) {
-        isFakeRun = true; // Prevent infinite recursion
-        console.debug(`[HTML] rendering #${message_idx} message`);
-        if (message.is_user) {
-            await eventSource.emit(event_types.USER_MESSAGE_RENDERED, message_id);
-        } else if (!message.is_system) {
-            await eventSource.emit(event_types.CHARACTER_MESSAGE_RENDERED, message_id, type);
-        }
-        isFakeRun = false;
-    }
+// ---------------------------------------------------------------------------
+// TauriTavern ChatSurface (Chat DOM virtualization) support.
+// Under bounded ChatSurface the host owns `.mes_text`; templates must be
+// evaluated into an HTML string by a content processor instead of rewriting
+// the live DOM (which destroys runtime sources claimed by JS-Slash-Runner).
+// ---------------------------------------------------------------------------
 
-    if (!message.is_ejs_processed)
-        message.is_ejs_processed = [];
-    message.is_ejs_processed[message.swipe_id || 0] = true;
+interface ChatSurfaceContentRegistration {
+    refresh(): Promise<void>;
+}
 
-    const end = Date.now() - start;
-    console.log(`[Prompt Template] processing #${message_idx} messages in ${end}ms`);
+const CHAT_SURFACE_PROCESSOR_ID = 'st-prompt-template/message-content';
+let chatSurfaceRegistration: ChatSurfaceContentRegistration | null = null;
+// Raw message state (swipe + mes) whose non-dry render already ran in this page.
+const chatSurfaceEvaluated = new WeakMap<object, string>();
+const saveAfterChatSurfaceRender = _.debounce(() => {
+    checkAndSave().catch(error => console.error('[Prompt Template] save failed:', error));
+}, 500);
+
+function rawMessageKey(message: Message): string {
+    return `${message.swipe_id ?? 0}\u0000${message.mes}`;
+}
+
+function htmlToText(html: string): string {
+    // <template> parses without loading resources or running scripts.
+    const template = document.createElement('template');
+    template.innerHTML = html;
+    return template.content.textContent ?? '';
+}
+
+async function prepareChatSurfaceContent(
+    { message, mesid, signal }: { message: Message; mesid: number; signal: AbortSignal },
+    renderBase: () => Promise<string>,
+): Promise<string> {
+    if (settings.enabled === false || settings.render_enabled === false)
+        return renderBase();
+    if (settings.depth_limit > -1 && chat.length - mesid - 1 > settings.depth_limit)
+        return renderBase();
+    if (!message?.mes || message.mes === '...')
+        return renderBase();
+
+    const start = Date.now();
+    // First render of a message (or of edited/swiped content) is a real run; re-renders are dry runs.
+    const isDryRun = chatSurfaceEvaluated.get(message) === rawMessageKey(message);
+    STATE.isDryRun = isDryRun;
+
+    const { rawContent, content, newContent } = await evaluateMessageContent(mesid, message, isDryRun, {
+        // The host re-formats `message.mes` when it changed before the first renderBase() call.
+        readContent: renderBase,
+        commitRawMessage: () => {},
+        signal,
+    });
+    const base = rawContent ?? await renderBase();
+    if (signal.aborted)
+        return base;
+
+    chatSurfaceEvaluated.set(message, rawMessageKey(message));
+    markEjsProcessed(message);
+    const html = newContent && newContent !== content ? newContent : base;
+
+    console.log(`[Prompt Template] processing #${mesid} messages in ${Date.now() - start}ms`);
 
     if (!isDryRun) {
-        await checkAndSave();
-        updateTokens(container.text(), 'receive');
+        saveAfterChatSurfaceRender();
+        if (mesid >= chat.length - 1)
+            updateTokens(htmlToText(html), 'receive');
+    }
+    return html;
+}
+
+/**
+ * Registers the ChatSurface content processor. Called from the manifest `chatSurface` hook,
+ * which TauriTavern only invokes before the first projection of a virtualized chat.
+ */
+export function registerChatSurfaceProcessor(): boolean {
+    // @ts-expect-error: TauriTavern host API
+    const api = window.__TAURITAVERN__?.api?.chatSurface;
+    if (typeof api?.registerContentProcessor !== 'function')
+        return false;
+    if (!chatSurfaceRegistration) {
+        chatSurfaceRegistration = api.registerContentProcessor({
+            id: CHAT_SURFACE_PROCESSOR_ID,
+            prepare: prepareChatSurfaceContent,
+        }) as ChatSurfaceContentRegistration;
+        console.log('[Prompt Template] ChatSurface content processor registered');
+    }
+    return true;
+}
+
+async function refreshChatSurfaceContent() {
+    try {
+        await chatSurfaceRegistration?.refresh();
+    } catch (error) {
+        console.error('[Prompt Template] ChatSurface refresh failed:', error);
     }
 }
 
@@ -737,7 +869,10 @@ export async function handlePreloadWorldInfo(chat_filename?: string, force: bool
     console.log(`[Prompt Template] processing ${enabledWorldInfo.length} world info in ${end}ms`);
 
     // avoid multiple updates
-    if (chat.length > 1) {
+    if (chatSurfaceRegistration) {
+        console.log('[Prompt Template] *** REFRESH CHATSURFACE MESSAGES ***');
+        await refreshChatSurfaceContent();
+    } else if (chat.length > 1) {
         console.log('[Prompt Template] *** UPDATE ALL MESSAGES ***');
         for (const mes of $('div.mes[mesid]')) {
             const message_id = $(mes).attr('mesid');
